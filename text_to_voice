@@ -1,0 +1,303 @@
+from fastapi import FastAPI, Request, File, UploadFile, Form, HTTPException
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+import os
+from dotenv import load_dotenv 
+from app.rag_utils import load_and_embed, run_qa, text_to_speech_elevenlabs
+from app.fasterwhisper_utils import transcribe_audio
+from app.db import insert_chat_log
+from elevenlabs import set_api_key
+
+load_dotenv()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
+
+if not OPENAI_API_KEY or not ELEVENLABS_API_KEY:
+    raise ValueError("OPENAI_API_KEY and ELEVENLABS_API_KEY must be set in .env file")
+
+set_api_key(ELEVENLABS_API_KEY)
+
+app = FastAPI()
+app.mount("/static", StaticFiles(directory="app/static"), name="static")
+templates = Jinja2Templates(directory="app/templates")
+
+UPLOAD_FOLDER = "uploaded_files/"
+AUDIO_INPUTS = "audio_inputs/"
+AUDIO_OUTPUTS = "audio_outputs/"
+
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(AUDIO_INPUTS, exist_ok=True)
+os.makedirs(AUDIO_OUTPUTS, exist_ok=True)
+
+@app.get("/", response_class=HTMLResponse)
+async def home(request: Request):
+    try:
+        return templates.TemplateResponse("index.html", {"request": request})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error rendering template: {str(e)}")
+
+@app.post("/upload/")
+async def upload(file: UploadFile = File(...)):
+    try:
+        if not file.filename.endswith('.pdf'):
+            raise HTTPException(status_code=400, detail="Only PDF files are supported")
+        
+        file_path = os.path.join(UPLOAD_FOLDER, file.filename)
+        with open(file_path, "wb") as f:
+            f.write(await file.read())
+        
+        if not load_and_embed(file_path, OPENAI_API_KEY):
+            raise HTTPException(status_code=500, detail="Failed to process and embed file")
+        
+        return {"message": "File uploaded and embedded successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error uploading file: {str(e)}")
+
+@app.post("/ask/")
+async def ask(
+    input_text: str = Form(None),
+    audio: UploadFile = File(None),
+    output_type: str = Form("text")
+):
+    try:
+        if not input_text and not audio:
+            raise HTTPException(status_code=400, detail="Either text or audio input is required")
+
+        if audio:
+            if not audio.filename.endswith(('.mp3', '.wav')):
+                raise HTTPException(status_code=400, detail="Only MP3 or WAV audio files are supported")
+            audio_path = os.path.join(AUDIO_INPUTS, audio.filename)
+            with open(audio_path, "wb") as f:
+                f.write(await audio.read())
+            input_text = transcribe_audio(audio_path)
+            if not input_text:
+                raise HTTPException(status_code=500, detail="Failed to transcribe audio")
+
+        answer = run_qa(input_text, OPENAI_API_KEY)
+        if not answer:
+            raise HTTPException(status_code=500, detail="Failed to generate answer")
+
+        insert_chat_log(input_text, answer)
+
+        if output_type == "audio":
+            audio_path = os.path.join(AUDIO_OUTPUTS, "response.mp3")
+            if not text_to_speech_elevenlabs(answer, audio_path):
+                raise
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+main.py
+from fastapi import FastAPI, Request, File, UploadFile, Form
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+import os
+from dotenv import load_dotenv 
+from app.rag_utils import load_and_embed, run_qa,text_to_speech_elevenlabs
+from app.fasterwhisper_utils import transcribe_audio
+from app.tts_utils import text_to_audio
+from app.db import insert_chat_log
+from elevenlabs import generate, play, save, set_api_key
+
+load_dotenv()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+set_api_key("YOUR_API_KEY_HERE")
+
+app = FastAPI()
+app.mount("/static", StaticFiles(directory="app/static"), name="static")
+templates = Jinja2Templates(directory="app/templates")
+
+UPLOAD_FOLDER = "uploaded_files/"
+AUDIO_INPUTS = "audio_inputs/"
+AUDIO_OUTPUTS = "audio_outputs/"
+
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(AUDIO_INPUTS, exist_ok=True)
+os.makedirs(AUDIO_OUTPUTS, exist_ok=True)
+
+@app.get("/", response_class=HTMLResponse)
+async def home(request: Request):
+    return templates.TemplateResponse("index.html", {"request": request})
+
+@app.post("/upload/")
+async def upload(file: UploadFile = File(...)):
+    file_path = os.path.join(UPLOAD_FOLDER, file.filename)
+    with open(file_path, "wb") as f:
+        f.write(await file.read())
+    
+    load_and_embed(file_path, OPENAI_API_KEY)
+    
+    return {"message": "File uploaded and embedded."}
+
+@app.post("/ask/")
+async def ask(
+    input_text: str = Form(None),
+    audio: UploadFile = File(None),
+    output_type: str = Form("text")
+):
+    if audio:
+        audio_path = os.path.join(AUDIO_INPUTS, audio.filename)
+        with open(audio_path, "wb") as f:
+            f.write(await audio.read())
+        input_text = transcribe_audio(audio_path)
+
+    answer = run_qa(input_text, OPENAI_API_KEY)
+
+    insert_chat_log(input_text, answer)
+
+    if output_type == "audio":
+        audio_path = os.path.join(AUDIO_OUTPUTS, "response.mp3")
+        text_to_audio(answer, audio_path)
+        return FileResponse(audio_path, media_type="audio/mpeg", filename="response.mp3")
+
+    return JSONResponse(content={"response": answer})
+
+rag_utils.py
+from langchain.document_loaders import PyPDFLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.embeddings import OpenAIEmbeddings
+from langchain.vectorstores import FAISS
+from langchain.chains import RetrievalQA
+from langchain.llms import OpenAI
+
+vector_store = None
+
+def load_and_embed(file_path, api_key):
+    global vector_store
+    try:
+        loader = PyPDFLoader(file_path)
+        documents = loader.load()
+        
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=200
+        )
+        texts = text_splitter.split_documents(documents)
+        
+        embeddings = OpenAIEmbeddings(openai_api_key=api_key)
+        vector_store = FAISS.from_documents(texts, embeddings)
+        return True
+    except Exception as e:
+        print(f"Error in load_and_embed: {e}")
+        return False
+
+def run_qa(query, api_key):
+    global vector_store
+    if vector_store is None:
+        return "No document has been uploaded yet."
+    
+    try:
+        llm = OpenAI(openai_api_key=api_key)
+        qa_chain = RetrievalQA.from_chain_type(
+            llm=llm,
+            chain_type="stuff",
+            retriever=vector_store.as_retriever()
+        )
+        result = qa_chain.run(query)
+        return result
+    except Exception as e:
+        return f"Error processing query: {e}"
+def text_to_speech_elevenlabs(text, voice="Rachel", output_file="output.wav"):
+    audio = generate(
+        text=text,
+        voice=voice,
+        model="eleven_monolingual_v1" 
+    )
+    save(audio, output_file)
+    play(audio)
+
+tts_utils.py
+import sqlite3
+from datetime import datetime
+
+def insert_chat_log(query, response):
+    try:
+        conn = sqlite3.connect('chat_history.db')
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS chat_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                query TEXT,
+                response TEXT,
+                timestamp TEXT
+            )
+        ''')
+        
+        timestamp = datetime.now().isoformat()
+        cursor.execute('INSERT INTO chat_log (query, response, timestamp) VALUES (?, ?, ?)',
+                      (query, response, timestamp))
+        
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Error in insert_chat_log: {e}")
+
+db.py
+from sqlalchemy import create_engine, Column, String, Integer, Text, Table, MetaData
+from sqlalchemy.orm import sessionmaker
+
+engine = create_engine("sqlite:///chat.db")
+metadata = MetaData()
+
+chat_logs = Table(
+    'chat_logs', metadata,
+    Column('id', Integer, primary_key=True),
+    Column('question', Text),
+    Column('answer', Text),
+)
+
+metadata.create_all(engine)
+Session = sessionmaker(bind=engine)
+
+def insert_chat_log(question: str, answer: str):
+    with Session() as session:
+        session.execute(chat_logs.insert().values(question=question, answer=answer))
+        session.commit()
+
+
+fasterwhisper_utils.py
+from faster_whisper import WhisperModel
+import os
+
+def transcribe_audio(audio_path):
+    try:
+        model = WhisperModel("small", device="cpu", compute_type="int8")
+        segments, _ = model.transcribe(audio_path, beam_size=5)
+        transcription = " ".join(segment.text for segment in segments)
+        return transcription
+    except Exception as e:
+        print(f"Error in transcribe_audio: {e}")
+        return ""
+
+
+
+
