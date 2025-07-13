@@ -15,7 +15,7 @@ load_dotenv()
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
 # 🔐 Set your AssemblyAI API Key
-aai.settings.api_key = "b49fff204f2b478b99fabe619efe81eb"  # 🔁 Replace with real key
+aai.settings.api_key =   # 🔁 Replace with real key
 
 # Initialize shared objects
 _embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
