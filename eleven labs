@@ -1,0 +1,29 @@
+def text_to_speech(text, filename):
+    audio_stream = elevenlabs.text_to_speech.stream(
+        text=text,
+        voice_id="JBFqnCBsd6RMkjVDRZzb",  # Your preferred voice
+        model_id="eleven_multilingual_v2"
+    )
+
+    output_path = os.path.join("temp_audio", filename)
+    save(audio_stream, output_path)
+    return output_path
+
+
+
+
+
+
+
+
+
+elevenlabs = ElevenLabs(
+    api_key=os.getenv("ELEVEN_API_KEY")  # Or hardcode your API key (not recommended)
+)
+
+
+
+
+
+from elevenlabs.client import ElevenLabs
+from elevenlabs import save
