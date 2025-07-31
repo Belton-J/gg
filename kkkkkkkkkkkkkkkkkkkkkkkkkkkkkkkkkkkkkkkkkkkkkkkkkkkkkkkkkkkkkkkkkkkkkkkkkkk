@@ -1,0 +1,447 @@
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+import os
+import uuid
+import base64
+from utils import (
+    extract_text_from_pdfs,
+    chunk_text,
+    save_vectors_simple,
+    classify_question,
+    get_chat_response,
+    friendly_agent,
+    transcribe_audio_with_llm,
+    extract_text_from_image_with_llm
+)
+
+app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+TEMP_DIR = "temp_audio"
+os.makedirs(TEMP_DIR, exist_ok=True)
+
+
+@app.post("/upload-pdfs")
+async def upload_pdfs(files: list[UploadFile] = File(...)):
+    if len(files) > 5:
+        raise HTTPException(status_code=400, detail="You can upload up to 5 PDF files only.")
+    try:
+        pdf_file_objs = [file.file for file in files]
+        text = extract_text_from_pdfs(pdf_file_objs)
+        chunks = chunk_text(text)
+        save_vectors_simple(chunks)
+        return {"message": "PDFs processed and stored in vector DB."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}")
+
+
+@app.post("/voice-chat")
+async def voice_chat(audio: UploadFile = File(...)):
+    try:
+        uid = str(uuid.uuid4())
+        audio_path = os.path.join(TEMP_DIR, f"{uid}.wav")
+        with open(audio_path, "wb") as f:
+            f.write(await audio.read())
+
+        question_text = transcribe_audio_with_llm(audio_path)
+        route = classify_question(question_text)
+        answer_text = get_chat_response(question_text) if route == "pdf" else friendly_agent(question_text)
+        return JSONResponse({"transcribed": question_text, "answer": answer_text})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/upload-audio")
+async def upload_audio(audio: UploadFile = File(...)):
+    try:
+        uid = str(uuid.uuid4())
+        audio_path = os.path.join(TEMP_DIR, f"{uid}.mp4")
+        with open(audio_path, "wb") as f:
+            f.write(await audio.read())
+
+        question_text = transcribe_audio_with_llm(audio_path)
+        route = classify_question(question_text)
+        answer_text = get_chat_response(question_text) if route == "pdf" else friendly_agent(question_text)
+        return JSONResponse({"transcribed": question_text, "answer": answer_text})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/upload-image")
+async def upload_image(image: UploadFile = File(...)):
+    try:
+        image_data = await image.read()
+        base64_str = base64.b64encode(image_data).decode("utf-8")
+        text = extract_text_from_image_with_llm(base64_str)
+        return JSONResponse({"text": text})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/chat")
+async def text_chat(question: str):
+    try:
+        route = classify_question(question)
+        answer_text = get_chat_response(question) if route == "pdf" else friendly_agent(question)
+        return JSONResponse({"question": question, "answer": answer_text})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import os
+import base64
+import pdfplumber
+from dotenv import load_dotenv
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
+from langchain_core.prompts import PromptTemplate
+from langchain_community.vectorstores import FAISS
+from langchain.memory import ConversationBufferMemory
+from langchain.memory.chat_message_histories import ChatMessageHistory
+from google import genai
+from google.genai.types import Part
+
+load_dotenv()
+
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+
+# === Initialize embeddings and chat model ===
+_embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+_model = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0)
+
+# === FAISS vector store path ===
+_index_path = "faiss_index"
+os.makedirs(_index_path, exist_ok=True)
+
+# === Conversation Memory (Updated for LangChain 0.2+) ===
+pdf_memory = ConversationBufferMemory(
+    memory_key="chat_history",
+    chat_memory=ChatMessageHistory()
+)
+friendly_memory = ConversationBufferMemory(
+    memory_key="chat_history",
+    chat_memory=ChatMessageHistory()
+)
+
+# === Gemini client ===
+gemini_client = genai.Client(api_key=GOOGLE_API_KEY)
+
+
+# -------------------------------
+# PDF Processing
+# -------------------------------
+def extract_text_from_pdfs(pdf_files):
+    """Extract text from multiple PDF files."""
+    text = ""
+    for file in pdf_files:
+        with pdfplumber.open(file) as pdf:
+            for page in pdf.pages:
+                text += page.extract_text() or ""
+                text += "\n"
+    return text
+
+
+def chunk_text(text, chunk_size=800, chunk_overlap=200):
+    """Split long text into overlapping chunks for embeddings."""
+    splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+    return splitter.split_text(text)
+
+
+def save_vectors_simple(chunks):
+    """Save text chunks into a FAISS vector store."""
+    vector_store = FAISS.from_texts(chunks, embedding=_embeddings)
+    vector_store.save_local(_index_path)
+
+
+# -------------------------------
+# Chat Classification
+# -------------------------------
+def classify_question(question: str) -> str:
+    """Classify a question as 'friendly' or 'pdf'."""
+    classifier_prompt = PromptTemplate(
+        template="""
+        Classify the question below as either 'friendly' or 'pdf'.
+        If it relates to uploaded documents or technical context, return 'pdf'.
+        Otherwise, return 'friendly'.
+
+        Question:
+        {question}
+
+        Answer:
+        """,
+        input_variables=["question"]
+    )
+    chain = classifier_prompt | _model
+    result = chain.invoke({"question": question})
+    classification = result.content.strip().lower()
+    return "pdf" if "pdf" in classification else "friendly"
+
+
+def format_memory(memory: ConversationBufferMemory) -> str:
+    """Format conversation memory into a readable string."""
+    return "\n".join([f"{msg.type.upper()}: {msg.content}" for msg in memory.chat_memory.messages])
+
+
+# -------------------------------
+# PDF Chat Agent
+# -------------------------------
+def get_chat_response(question: str) -> str:
+    """Get response based on uploaded PDFs using vector search."""
+    if not os.path.exists(os.path.join(_index_path, "index.faiss")):
+        raise ValueError("Vector store not found. Upload PDFs first.")
+
+    vectordb = FAISS.load_local(_index_path, _embeddings, allow_dangerous_deserialization=True)
+    retriever = vectordb.as_retriever()
+    docs = retriever.get_relevant_documents(question)
+    context_text = "\n\n".join([doc.page_content for doc in docs])
+
+    prompt = PromptTemplate(
+        template="""
+        You are a helpful assistant. Use the following context to answer the question.
+        If the answer isn't found in the context, say "I don't know".
+
+        Context:
+        {context}
+
+        Chat History:
+        {history}
+
+        Question:
+        {question}
+
+        Answer:
+        """,
+        input_variables=["context", "history", "question"]
+    )
+
+    chain = {"context": lambda x: x["context"],
+             "history": lambda x: x["history"],
+             "question": lambda x: x["question"]} | prompt | _model
+
+    history = format_memory(pdf_memory)
+    result = chain.invoke({
+        "context": context_text,
+        "history": history,
+        "question": question
+    })
+
+    pdf_memory.chat_memory.add_user_message(question)
+    pdf_memory.chat_memory.add_ai_message(result.content)
+    return result.content
+
+
+# -------------------------------
+# Friendly Chat Agent
+# -------------------------------
+def friendly_agent(question: str) -> str:
+    """Simple friendly chatbot agent."""
+    prompt = PromptTemplate(
+        template="""
+        You are a friendly chatbot. Engage in light, supportive conversation.
+
+        Chat History:
+        {history}
+
+        User: {question}
+        Bot:
+        """,
+        input_variables=["history", "question"]
+    )
+
+    chain = {"history": lambda x: x["history"],
+             "question": lambda x: x["question"]} | prompt | _model
+
+    history = format_memory(friendly_memory)
+    result = chain.invoke({"history": history, "question": question})
+
+    friendly_memory.chat_memory.add_user_message(question)
+    friendly_memory.chat_memory.add_ai_message(result.content)
+    return result.content
+
+
+# -------------------------------
+# Audio Transcription (Simulated)
+# -------------------------------
+def transcribe_audio_with_llm(audio_path: str) -> str:
+    """Simulated transcription - replace with Whisper for production."""
+    with open(audio_path, "rb") as f:
+        audio_bytes = f.read()
+    audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+
+    prompt = PromptTemplate(
+        template="""
+        You are an AI model that can understand audio from base64 input.
+        Convert the following audio (base64 encoded) into transcribed English text.
+
+        Audio (base64):
+        {audio}
+
+        Transcribed Text:
+        """,
+        input_variables=["audio"]
+    )
+
+    chain = prompt | _model
+    result = chain.invoke({"audio": audio_b64})
+    return result.content.strip()
+
+
+# -------------------------------
+# Gemini Image OCR
+# -------------------------------
+def extract_text_from_image_with_llm(base64_image: str) -> str:
+    """Extract text from image using Gemini Flash 2.0 OCR."""
+    try:
+        image_bytes = base64.b64decode(base64_image)
+
+        # ✅ Use Part to represent image input
+        image_part = Part.from_bytes(data=image_bytes, mime_type="image/jpeg")
+
+        response = gemini_client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=[
+                image_part,
+                "Extract all visible text from this image. If none, say 'No text found.'"
+            ]
+        )
+        return response.text.strip() if response.text else "No text found."
+
+    except Exception as e:
+        return f"Error extracting text: {str(e)}"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import streamlit as st
+import requests
+
+BACKEND_URL = "http://localhost:8000"  # Change to your deployed URL if hosted
+
+st.set_page_config(page_title="Multimodal Assistant", layout="centered")
+st.title("🤖 Multimodal AI Assistant")
+
+tab1, tab2, tab3, tab4 = st.tabs(["📄 Upload PDFs", "💬 Ask Question", "🎤 Voice Q&A", "🖼️ Image to Text"])
+
+# =========================
+# 📄 Upload PDFs
+# =========================
+with tab1:
+    st.subheader("Upload up to 5 PDF files")
+    uploaded_pdfs = st.file_uploader("Choose PDFs", type=["pdf"], accept_multiple_files=True)
+    if uploaded_pdfs and st.button("Upload PDFs"):
+        if len(uploaded_pdfs) > 5:
+            st.error("❌ You can upload up to 5 PDFs only.")
+        else:
+            files = [("files", (pdf.name, pdf.read(), "application/pdf")) for pdf in uploaded_pdfs]
+            response = requests.post(f"{BACKEND_URL}/upload-pdfs", files=files)
+            if response.status_code == 200:
+                st.success("✅ PDFs uploaded and processed successfully.")
+            else:
+                st.error(f"❌ Error: {response.json().get('detail')}")
+
+# =========================
+# 💬 Ask Question
+# =========================
+with tab2:
+    st.subheader("Ask a Question")
+    question = st.text_input("Your Question")
+    if st.button("Get Answer"):
+        response = requests.get(f"{BACKEND_URL}/chat", params={"question": question})
+        if response.status_code == 200:
+            st.markdown("**Answer:**")
+            st.write(response.json()["answer"])
+        else:
+            st.error(f"❌ Error: {response.json().get('detail')}")
+
+# =========================
+# 🎤 Voice Q&A
+# =========================
+with tab3:
+    st.subheader("Upload Voice File (.wav)")
+    audio_file = st.file_uploader("Choose a .wav file", type=["wav"])
+    if audio_file and st.button("Transcribe & Ask"):
+        files = {"audio": (audio_file.name, audio_file.read(), "audio/wav")}
+        response = requests.post(f"{BACKEND_URL}/voice-chat", files=files)
+        if response.status_code == 200:
+            result = response.json()
+            st.markdown("**Transcribed:**")
+            st.write(result["transcribed"])
+            st.markdown("**Answer:**")
+            st.write(result["answer"])
+        else:
+            st.error(f"❌ Error: {response.json().get('detail')}")
+
+# =========================
+# 🖼️ Image to Text
+# =========================
+with tab4:
+    st.subheader("Upload Image for OCR")
+    image_file = st.file_uploader("Choose an image", type=["png", "jpg", "jpeg"])
+    if image_file and st.button("Extract Text"):
+        files = {"image": (image_file.name, image_file.read(), image_file.type)}
+        response = requests.post(f"{BACKEND_URL}/upload-image", files=files)
+        if response.status_code == 200:
+            st.markdown("**Extracted Text:**")
+            st.write(response.json()["text"])
+        else:
+            st.error(f"❌ Error: {response.json().get('detail')}")
